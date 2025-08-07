@@ -1,6 +1,7 @@
 name = "hono-chat-app"
 main = "src/index.js"
 compatibility_date = "2023-12-01"
+compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "DB"
