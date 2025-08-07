@@ -1,12 +1,103 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import bcrypt from 'bcryptjs'
-import jwt from 'jsonwebtoken'
 
 const app = new Hono()
 
 // CORS middleware
 app.use('*', cors())
+
+// Helper functions for crypto operations using Web Crypto API
+async function hashPassword(password) {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(password)
+  const hash = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function verifyPassword(password, hashedPassword) {
+  const hashedInput = await hashPassword(password)
+  return hashedInput === hashedPassword
+}
+
+async function createJWT(payload, secret) {
+  const header = { alg: 'HS256', typ: 'JWT' }
+  const encoder = new TextEncoder()
+  
+  const encodedHeader = btoa(JSON.stringify(header))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '')
+    
+  const encodedPayload = btoa(JSON.stringify({
+    ...payload,
+    exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60) // 24 hours
+  }))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '')
+
+  const data = encodedHeader + '.' + encodedPayload
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data))
+  const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '')
+    
+  return data + '.' + encodedSignature
+}
+
+async function verifyJWT(token, secret) {
+  try {
+    const [encodedHeader, encodedPayload, encodedSignature] = token.split('.')
+    
+    if (!encodedHeader || !encodedPayload || !encodedSignature) {
+      return null
+    }
+
+    const encoder = new TextEncoder()
+    const data = encodedHeader + '.' + encodedPayload
+    
+    const key = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    )
+    
+    const signature = new Uint8Array(
+      atob(encodedSignature.replace(/-/g, '+').replace(/_/g, '/'))
+        .split('')
+        .map(c => c.charCodeAt(0))
+    )
+    
+    const isValid = await crypto.subtle.verify('HMAC', key, signature, encoder.encode(data))
+    
+    if (!isValid) {
+      return null
+    }
+    
+    const payload = JSON.parse(atob(encodedPayload.replace(/-/g, '+').replace(/_/g, '/')))
+    
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      return null
+    }
+    
+    return payload
+  } catch (error) {
+    return null
+  }
+}
 
 // Serve static HTML files
 app.get('/', (c) => {
@@ -29,13 +120,13 @@ const authMiddleware = async (c, next) => {
     return c.json({ error: 'No token provided' }, 401)
   }
 
-  try {
-    const decoded = jwt.verify(token, c.env.JWT_SECRET)
-    c.set('user', decoded)
-    await next()
-  } catch (error) {
+  const decoded = await verifyJWT(token, c.env.JWT_SECRET)
+  if (!decoded) {
     return c.json({ error: 'Invalid token' }, 401)
   }
+
+  c.set('user', decoded)
+  await next()
 }
 
 // Register endpoint
@@ -51,7 +142,7 @@ app.post('/api/register', async (c) => {
       return c.json({ error: 'Password must be at least 6 characters' }, 400)
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10)
+    const hashedPassword = await hashPassword(password)
     
     const stmt = c.env.DB.prepare(`
       INSERT INTO users (username, email, password) 
@@ -64,10 +155,9 @@ app.post('/api/register', async (c) => {
       return c.json({ error: 'Username or email already exists' }, 400)
     }
 
-    const token = jwt.sign(
+    const token = await createJWT(
       { id: result.meta.last_row_id, username, email },
-      c.env.JWT_SECRET,
-      { expiresIn: '24h' }
+      c.env.JWT_SECRET
     )
 
     return c.json({ 
@@ -97,16 +187,15 @@ app.post('/api/login', async (c) => {
       return c.json({ error: 'Invalid credentials' }, 401)
     }
 
-    const isValidPassword = await bcrypt.compare(password, user.password)
+    const isValidPassword = await verifyPassword(password, user.password)
     
     if (!isValidPassword) {
       return c.json({ error: 'Invalid credentials' }, 401)
     }
 
-    const token = jwt.sign(
+    const token = await createJWT(
       { id: user.id, username: user.username, email: user.email },
-      c.env.JWT_SECRET,
-      { expiresIn: '24h' }
+      c.env.JWT_SECRET
     )
 
     return c.json({ 
